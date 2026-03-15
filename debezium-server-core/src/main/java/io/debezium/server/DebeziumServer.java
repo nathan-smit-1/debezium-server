@@ -12,11 +12,13 @@ import java.util.Properties;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
+import jakarta.enterprise.inject.Instance;
 import jakarta.enterprise.inject.spi.BeanManager;
 import jakarta.inject.Inject;
 
@@ -46,12 +48,22 @@ import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.Startup;
 
 /**
- * <p>The entry point of the Quarkus-based standalone server. The server is configured via Quarkus/Microprofile Configuration sources
- * and provides few out-of-the-box target implementations.</p>
- * <p>The implementation uses CDI to find all classes that implements {@link DebeziumEngine.ChangeConsumer} interface.
- * The candidate classes should be annotated with {@code @Named} annotation and should be {@code Dependent}.</p>
- * <p>The configuration option {@code debezium.consumer} provides a name of the consumer that should be used and the value
- * must match to exactly one of the implementation classes.</p>
+ * <p>
+ * The entry point of the Quarkus-based standalone server. The server is
+ * configured via Quarkus/Microprofile Configuration sources
+ * and provides few out-of-the-box target implementations.
+ * </p>
+ * <p>
+ * The implementation uses CDI to find all classes that implements
+ * {@link DebeziumEngine.ChangeConsumer} interface.
+ * The candidate classes should be annotated with {@code @Named} annotation and
+ * should be {@code Dependent}.
+ * </p>
+ * <p>
+ * The configuration option {@code debezium.consumer} provides a name of the
+ * consumer that should be used and the value
+ * must match to exactly one of the implementation classes.
+ * </p>
  *
  * @author Jiri Pechanec
  *
@@ -96,6 +108,12 @@ public class DebeziumServer {
 
     private static final Pattern SHELL_PROPERTY_NAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_]+_+[a-zA-Z0-9_]+$");
 
+    private static final String PROP_RESTART_PREFIX = PROP_SINK_PREFIX + "restart.";
+    private static final String PROP_RESTART_MAX_ATTEMPTS = PROP_RESTART_PREFIX + "max.attempts";
+    private static final String PROP_RESTART_INITIAL_DELAY_MS = PROP_RESTART_PREFIX + "initial.delay.ms";
+    private static final String PROP_RESTART_MAX_DELAY_MS = PROP_RESTART_PREFIX + "max.delay.ms";
+    private static final String PROP_RESTART_BACKOFF_MULTIPLIER = PROP_RESTART_PREFIX + "backoff.multiplier";
+
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private int returnCode = 0;
 
@@ -108,6 +126,9 @@ public class DebeziumServer {
     @Inject
     @Liveness
     ConnectorLifecycle health;
+
+    @Inject
+    Instance<SinkErrorStrategy> sinkErrorStrategy;
 
     private DefaultChangeConsumer consumer;
 
@@ -133,8 +154,10 @@ public class DebeziumServer {
         configToProperties(config, props, PROP_KEY_FORMAT_PREFIX, "key.converter.", true);
         configToProperties(config, props, PROP_VALUE_FORMAT_PREFIX, "value.converter.", true);
         configToProperties(config, props, PROP_HEADER_FORMAT_PREFIX, "header.converter.", true);
-        configToProperties(config, props, PROP_SINK_PREFIX + name + ".", SchemaHistory.CONFIGURATION_FIELD_PREFIX_STRING + name + ".", false);
-        configToProperties(config, props, PROP_SINK_PREFIX + name + ".", PROP_OFFSET_STORAGE_PREFIX + name + ".", false);
+        configToProperties(config, props, PROP_SINK_PREFIX + name + ".",
+                SchemaHistory.CONFIGURATION_FIELD_PREFIX_STRING + name + ".", false);
+        configToProperties(config, props, PROP_SINK_PREFIX + name + ".", PROP_OFFSET_STORAGE_PREFIX + name + ".",
+                false);
 
         final Optional<String> transforms = config.getOptionalValue(PROP_TRANSFORMS, String.class);
         if (transforms.isPresent()) {
@@ -152,25 +175,56 @@ public class DebeziumServer {
         LOGGER.debug("Configuration for DebeziumEngine: {}", props);
 
         final Optional<String> engineFactory = config.getOptionalValue(PROP_ENGINE_FACTORY, String.class);
-        engine = DebeziumEngine.create(keyFormat, valueFormat, headerFormat, engineFactory.orElse(ConvertingAsyncEngineBuilderFactory.class.getName()))
-                .using(props)
-                .using((DebeziumEngine.ConnectorCallback) health)
-                .using((DebeziumEngine.CompletionCallback) health)
-                .notifying(consumer)
-                .build();
 
-        executor.execute(() -> {
-            try {
-                engine.run();
-            }
-            finally {
-                Quarkus.asyncExit(returnCode);
-            }
-        });
+        // Build the engine supplier for restart manager
+        final Supplier<DebeziumEngine<?>> engineSupplier = () -> {
+            engine = DebeziumEngine
+                    .create(keyFormat, valueFormat, headerFormat,
+                            engineFactory.orElse(ConvertingAsyncEngineBuilderFactory.class.getName()))
+                    .using(props)
+                    .using((DebeziumEngine.ConnectorCallback) health)
+                    .using((DebeziumEngine.CompletionCallback) health)
+                    .notifying(consumer)
+                    .build();
+            return engine;
+        };
+
+        // Resolve the SinkErrorStrategy if one is available
+        final Optional<SinkErrorStrategy> errorStrategy = sinkErrorStrategy.isResolvable()
+                ? Optional.of(sinkErrorStrategy.get())
+                : Optional.empty();
+
+        final int maxAttempts = config.getOptionalValue(PROP_RESTART_MAX_ATTEMPTS, Integer.class).orElse(0);
+        final long initialDelayMs = config.getOptionalValue(PROP_RESTART_INITIAL_DELAY_MS, Long.class).orElse(1000L);
+        final long maxDelayMs = config.getOptionalValue(PROP_RESTART_MAX_DELAY_MS, Long.class).orElse(300000L);
+        final double backoffMultiplier = config.getOptionalValue(PROP_RESTART_BACKOFF_MULTIPLIER, Double.class)
+                .orElse(2.0);
+
+        if (maxAttempts > 0 && errorStrategy.isPresent()) {
+            LOGGER.info(
+                    "Connector restart enabled: maxAttempts={}, initialDelayMs={}, maxDelayMs={}, backoffMultiplier={}",
+                    maxAttempts, initialDelayMs, maxDelayMs, backoffMultiplier);
+        }
+        else {
+            LOGGER.info("Connector restart is disabled");
+        }
+
+        final ConnectorRestartManager restartManager = new ConnectorRestartManager(
+                engineSupplier,
+                errorStrategy,
+                maxAttempts,
+                initialDelayMs,
+                maxDelayMs,
+                backoffMultiplier,
+                () -> Quarkus.asyncExit(0),
+                () -> Quarkus.asyncExit(returnCode != 0 ? returnCode : 1));
+
+        executor.execute(restartManager::run);
         LOGGER.info("Engine executor started");
     }
 
-    private void configToProperties(Config config, Properties props, String oldPrefix, String newPrefix, boolean overwrite) {
+    private void configToProperties(Config config, Properties props, String oldPrefix, String newPrefix,
+                                    boolean overwrite) {
         for (String name : config.getPropertyNames()) {
             String updatedPropertyName = null;
             if (SHELL_PROPERTY_NAME_PATTERN.matcher(name).matches()) {
@@ -252,7 +306,8 @@ public class DebeziumServer {
                 LOGGER.info("Cannot shut down engine now: ", e.getMessage());
             }
             executor.shutdown();
-            executor.awaitTermination(config.getOptionalValue(PROP_TERMINATION_WAIT, Integer.class).orElse(10), TimeUnit.SECONDS);
+            executor.awaitTermination(config.getOptionalValue(PROP_TERMINATION_WAIT, Integer.class).orElse(10),
+                    TimeUnit.SECONDS);
         }
         catch (Exception e) {
             LOGGER.error("Exception while shutting down Debezium", e);
@@ -272,10 +327,12 @@ public class DebeziumServer {
             config.getValue(PROP_SINK_TYPE, String.class);
         }
         catch (NoSuchElementException e) {
-            final String configFile = Paths.get(System.getProperty("user.dir"), "config", "application.properties").toString();
+            final String configFile = Paths.get(System.getProperty("user.dir"), "config", "application.properties")
+                    .toString();
             final String errorMessage = String
                     .format("Failed to load mandatory config value '%s'. Please check you have a correct Debezium server config in %s or required "
-                            + "properties are defined via system or environment variables.", PROP_SINK_TYPE, configFile);
+                            + "properties are defined via system or environment variables.", PROP_SINK_TYPE,
+                            configFile);
 
             // Print to stderr in case of logging misconfiguration.
             // CHECKSTYLE IGNORE check FOR NEXT 1 LINES
